@@ -18,11 +18,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"syscall"
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -185,11 +188,66 @@ func launcherCommand(launcher, wsPath string, task *v1alpha1.Task, files launche
 }
 
 // markLauncherDone records that the launcher finished for files' input.
+//
+// A runner that drops privileges has handed the .ax directory to the
+// unprivileged user, and root without CAP_DAC_OVERRIDE cannot create a file
+// there. The runner then takes the directory back for the write, as it can
+// still chown, and returns it to its owner.
 func markLauncherDone(wsPath string, files launcherFiles) {
 	p := doneMarkerPath(wsPath)
-	if err := os.WriteFile(p, []byte(files.digest), 0o644); err != nil {
+	err := writeFileReplacing(p, []byte(files.digest))
+	if errors.Is(err, fs.ErrPermission) && os.Geteuid() == 0 {
+		err = asDirOwner(filepath.Dir(p), func() error {
+			return writeFileReplacing(p, []byte(files.digest))
+		})
+	}
+	if err != nil {
 		slog.Warn("failed to record that the launcher finished", "path", p, "error", err)
 	}
+}
+
+// writeFileReplacing writes data to a new file next to p and renames it over
+// p, so an existing p that the writer cannot open, such as one owned by
+// another user, is replaced rather than rewritten.
+func writeFileReplacing(p string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+"-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), p)
+}
+
+// asDirOwner runs fn while the effective user owns dir, then gives dir back to
+// its previous owner.
+func asDirOwner(dir string, fn func() error) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("reading the owner of %s", dir)
+	}
+	if err := os.Chown(dir, os.Geteuid(), os.Getegid()); err != nil {
+		return err
+	}
+	fnErr := fn()
+	if err := os.Chown(dir, int(st.Uid), int(st.Gid)); err != nil {
+		return errors.Join(fnErr, fmt.Errorf("restoring the owner of %s: %w", dir, err))
+	}
+	return fnErr
 }
 
 func doneMarkerPath(wsPath string) string {

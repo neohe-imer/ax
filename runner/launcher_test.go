@@ -18,10 +18,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/ax/internal/workspace"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"github.com/google/ax/runner"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -192,6 +195,113 @@ cat "$AX_GOAL_FILE" > "$AX_OUTPUT_FILE"
 	if n := runs(t, dir); n != 2 {
 		t.Errorf("launcher ran %d times across failed run and resume, want 2", n)
 	}
+}
+
+// resume starts a runner on h's workspace and launcher with goal, waits until
+// it serves, and stops it.
+func resume(t *testing.T, h *harness, goal string) {
+	t.Helper()
+	again := newHarness(t)
+	again.wsPath, again.task.Spec.Workspace.Path = h.wsPath, h.wsPath
+	again.cfg.LauncherPath, again.cfg.RunDir = h.cfg.LauncherPath, h.cfg.RunDir
+	again.task.Spec.Goal = &v1alpha1.Goal{Text: goal}
+	again.start(t)
+	waitHealthy(t, again.cfg.Port)
+	time.Sleep(200 * time.Millisecond)
+	again.cancel()
+	again.waitFinished(t, 5*time.Second)
+}
+
+// A launcher-done marker the runner cannot open, such as one owned by the
+// user the command ran as, is replaced when the launcher finishes a new goal.
+func TestRun_ReplacesUnwritableLauncherDone(t *testing.T) {
+	h := newHarness(t)
+	dir := withLauncher(t, h, "first goal")
+	h.runUntilCommandExits(t)
+	h.cancel()
+	h.waitFinished(t, 5*time.Second)
+	if err := os.Chmod(filepath.Join(h.wsPath, ".ax", "launcher-done"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	next := newHarness(t)
+	next.wsPath, next.task.Spec.Workspace.Path = h.wsPath, h.wsPath
+	next.cfg.LauncherPath, next.cfg.RunDir = h.cfg.LauncherPath, h.cfg.RunDir
+	next.task.Spec.Goal = &v1alpha1.Goal{Text: "second goal"}
+	if exit := next.runUntilCommandExits(t); exit.Err != nil {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+	next.cancel()
+	next.waitFinished(t, 5*time.Second)
+
+	resume(t, h, "second goal")
+	if n := runs(t, dir); n != 2 {
+		t.Errorf("launcher ran %d times, want 2: the second goal ran again on resume", n)
+	}
+}
+
+// A runner that is root without CAP_DAC_OVERRIDE records launcher-done in a
+// .ax directory owned by the unprivileged user, and gives the directory back
+// (#740). Run it with: docker run --cap-drop DAC_OVERRIDE ... go test ./runner
+func TestRun_RecordsLauncherDoneInUserOwnedAxDir(t *testing.T) {
+	if os.Geteuid() != 0 || hasCapability(t, 1 /* CAP_DAC_OVERRIDE */) {
+		t.Skip("needs root without CAP_DAC_OVERRIDE")
+	}
+	h := newHarness(t)
+	dir := withLauncher(t, h, "one-shot goal")
+	axDir := filepath.Join(h.wsPath, ".ax")
+	if err := os.MkdirAll(axDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The state after a first run's setup handed .ax to UID 1000: setup has
+	// run, and the launcher (root here) has an output file it owns.
+	for _, name := range []string{workspace.InitializedMarkerFilename, "output"} {
+		if err := os.WriteFile(filepath.Join(axDir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chown(axDir, 1000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	// Give .ax back so that t.TempDir can remove it.
+	t.Cleanup(func() { _ = os.Chown(axDir, 0, 0) })
+
+	if exit := h.runUntilCommandExits(t); exit.Err != nil {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+	h.cancel()
+	h.waitFinished(t, 5*time.Second)
+	resume(t, h, "one-shot goal")
+	if n := runs(t, dir); n != 1 {
+		t.Errorf("launcher ran %d times for the same goal, want 1", n)
+	}
+	info, err := os.Stat(axDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := info.Sys().(*syscall.Stat_t); st.Uid != 1000 || st.Gid != 1000 {
+		t.Errorf(".ax is owned by %d:%d, want 1000:1000", st.Uid, st.Gid)
+	}
+}
+
+// hasCapability reports whether the process has capability bit in its
+// effective set, read from /proc/self/status.
+func hasCapability(t *testing.T, bit uint) bool {
+	t.Helper()
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return true
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		if hex, ok := strings.CutPrefix(line, "CapEff:"); ok {
+			caps, err := strconv.ParseUint(strings.TrimSpace(hex), 16, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return caps&(1<<bit) != 0
+		}
+	}
+	return true
 }
 
 // When Config.RunDir is empty and DefaultRunDir (/run/ax) cannot be created by
