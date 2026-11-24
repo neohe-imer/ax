@@ -258,7 +258,7 @@ Usage:
   ax [command] [flags]
 
 Available Commands:
-  apply -f <file>         Apply resources (tasks, workspaces, gateways, models) from a file or stdin
+  apply -f <file>...      Apply resources (tasks, workspaces, gateways, models) from files or stdin
   get tasks               List tasks
   get task <name>         Get a specific task
   get workspaces          List workspaces
@@ -308,11 +308,11 @@ func getAXClient(serverURL string) (v1alpha1.AXClient, *grpc.ClientConn, error) 
 
 // A nil atespace leaves manifest atespaces unchanged and lets the server default missing ones.
 func runApply(serverURL string, atespace *string, args []string) error {
-	data, ok, err := manifestFromArgs(args)
+	manifests, err := manifestsFromArgs(args)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if len(manifests) == 0 {
 		return fmt.Errorf("missing required flag: -f <file>")
 	}
 
@@ -325,6 +325,17 @@ func runApply(serverURL string, atespace *string, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	for _, m := range manifests {
+		if err := applyManifest(ctx, client, m.data, atespace); err != nil {
+			return fmt.Errorf("%s: %w", m.path, err)
+		}
+	}
+	return nil
+}
+
+// applyManifest applies the documents of one manifest in order and stops at
+// the first error.
+func applyManifest(ctx context.Context, client v1alpha1.AXClient, data []byte, atespace *string) error {
 	// Manifests are parsed here and submitted one resource at a time through the
 	// typed RPCs; the server never sees raw YAML.
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
@@ -828,28 +839,39 @@ func normalizeKind(kind string) (string, error) {
 	}
 }
 
-// manifestFromArgs returns the manifest named by -f/--file (or stdin for "-").
-// ok is false when no -f flag is present.
-func manifestFromArgs(args []string) (data []byte, ok bool, err error) {
+// manifest is the contents of one file named by -f/--file.
+type manifest struct {
+	path string // "-" for stdin
+	data []byte
+}
+
+// manifestsFromArgs reads every manifest named by -f/--file (or stdin for
+// "-"), in the order given. Like kubectl, it reads all of them before any is
+// applied, so a mistyped path fails without applying the files before it.
+func manifestsFromArgs(args []string) ([]manifest, error) {
+	var manifests []manifest
 	for i := 0; i < len(args); i++ {
 		if args[i] != "-f" && args[i] != "--file" {
 			continue
 		}
 		if i+1 >= len(args) {
-			return nil, true, errors.New("-f requires a file path (or - for stdin)")
+			return nil, errors.New("-f requires a file path (or - for stdin)")
 		}
-		path := args[i+1]
+		i++
+		path := args[i]
+		var data []byte
+		var err error
 		if path == "-" {
 			data, err = io.ReadAll(os.Stdin)
 		} else {
 			data, err = os.ReadFile(path)
 		}
 		if err != nil {
-			return nil, true, fmt.Errorf("reading %s: %w", path, err)
+			return nil, fmt.Errorf("reading %s: %w", path, err)
 		}
-		return data, true, nil
+		manifests = append(manifests, manifest{path: path, data: data})
 	}
-	return nil, false, nil
+	return manifests, nil
 }
 
 // lifecycleRPCTimeout bounds suspend/resume RPCs, which wait for Substrate to

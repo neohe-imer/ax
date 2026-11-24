@@ -674,3 +674,84 @@ func TestRunDescribeShowsLiveActorUID(t *testing.T) {
 		})
 	}
 }
+
+func TestRunApplyMultipleFiles(t *testing.T) {
+	workspace := func(name string) string {
+		return "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: " + name + "\nspec: {}\n"
+	}
+	dir := t.TempDir()
+	writeManifest := func(name, manifest string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(manifest), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	a := writeManifest("a.yaml", workspace("first"))
+	b := writeManifest("b.yaml", workspace("second")+"---\n"+workspace("third"))
+	invalid := writeManifest("invalid.yaml", "{}\n")
+	missing := filepath.Join(dir, "missing.yaml")
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		wantNames []string
+		wantErr   string
+	}{
+		{name: "two files", args: []string{"-f", a, "-f", b}, wantNames: []string{"first", "second", "third"}},
+		{name: "long and short flags", args: []string{"--file", b, "-f", a}, wantNames: []string{"second", "third", "first"}},
+		// Every file is read before anything is applied, as kubectl does.
+		{name: "missing second file", args: []string{"-f", a, "-f", missing}, wantErr: "reading " + missing},
+		{name: "second flag without path", args: []string{"-f", a, "-f"}, wantErr: "-f requires a file path"},
+		{name: "error names the file", args: []string{"-f", a, "-f", invalid, "-f", b}, wantNames: []string{"first"}, wantErr: invalid + ": applying document 1: missing kind"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := memory.NewStore()
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := server.NewServer(s, newTestTaskManager(substratetest.NewServer(t))).GRPCServer()
+			t.Cleanup(srv.Stop)
+			go func() { _ = srv.Serve(listener) }()
+
+			// runApply writes to os.Stdout, so these subtests must remain sequential.
+			output, err := os.CreateTemp(t.TempDir(), "stdout")
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout := os.Stdout
+			os.Stdout = output
+			t.Cleanup(func() {
+				os.Stdout = stdout
+				_ = output.Close()
+			})
+
+			runErr := runApply(listener.Addr().String(), nil, tc.args)
+			if tc.wantErr == "" {
+				if runErr != nil {
+					t.Fatal(runErr)
+				}
+			} else if runErr == nil || !strings.Contains(runErr.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, runErr)
+			}
+			var wantOutput strings.Builder
+			for _, name := range tc.wantNames {
+				wantOutput.WriteString("workspace.ax.io/" + name + " created\n")
+			}
+			data, err := os.ReadFile(output.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != wantOutput.String() {
+				t.Fatalf("expected output %q, got %q", wantOutput.String(), data)
+			}
+			workspaces, err := s.ListWorkspaces(context.Background(), "default", 100, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(workspaces) != len(tc.wantNames) {
+				t.Fatalf("expected %d workspaces, got %d", len(tc.wantNames), len(workspaces))
+			}
+		})
+	}
+}
